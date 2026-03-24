@@ -8,8 +8,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-//! Define the `Copy + Send + Sync` trait to mark that it is safe to instantiate the struct with random
-//! data.
+//! TODO
 
 use crate::atomic_integer::AtomicInteger;
 use crate::{ReadVolatile, WriteVolatile};
