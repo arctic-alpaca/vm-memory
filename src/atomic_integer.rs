@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
 use std::sync::atomic::Ordering;
+use zerocopy::{FromBytes, IntoBytes, KnownLayout};
 
 /// # Safety
 ///
@@ -9,7 +10,7 @@ use std::sync::atomic::Ordering;
 /// from [`std::sync::atomic`](https://doc.rust-lang.org/std/sync/atomic/), except for
 /// [`AtomicPtr<T>`](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html) and
 /// [`AtomicBool`](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicBool.html).
-pub unsafe trait AtomicInteger: Sync + Send {
+pub unsafe trait AtomicInteger: FromBytes + KnownLayout + IntoBytes + Sync + Send {
     /// The raw value type associated with the atomic integer (i.e. `u16` for `AtomicU16`).
     type V;
 

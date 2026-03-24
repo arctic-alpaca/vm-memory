@@ -6,6 +6,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
+//TODO: check all methods that perviously used `ByteValued` for reliance on guarantees provided by the trait.
+
 //! Types for volatile access to memory.
 //!
 //! Two of the core rules for safe rust is no data races and no aliased mutable references.
@@ -27,17 +29,19 @@
 //! not reordered or elided the access.
 
 use std::cmp::min;
-use std::io;
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::ptr::copy;
 use std::ptr::{read_volatile, write_volatile};
 use std::result;
 use std::sync::atomic::Ordering;
+use std::{io, slice};
 
 use crate::atomic_integer::AtomicInteger;
 use crate::bitmap::{Bitmap, BitmapSlice, BS};
-use crate::{AtomicAccess, ByteValued, Bytes};
+use crate::{AtomicAccess, Bytes};
+
+use zerocopy::{CastError, FromBytes, Immutable, IntoBytes, KnownLayout, Unalign};
 
 #[cfg(all(feature = "backend-mmap", feature = "xen", target_family = "unix"))]
 use crate::mmap::xen::{MmapXen as MmapInfo, MmapXenSlice};
@@ -70,6 +74,32 @@ pub enum Error {
     /// Incomplete read or write
     #[error("only used {completed} bytes in {expected} long buffer")]
     PartialBuffer { expected: usize, completed: usize },
+}
+
+impl<Src, Dst> From<(usize, CastError<Src, Dst>)> for Error
+where
+    Dst: FromBytes,
+{
+    fn from((value, error): (usize, CastError<Src, Dst>)) -> Self {
+        match error {
+            CastError::<Src, Dst>::Alignment(_) => Self::Misaligned {
+                addr: value,
+                alignment: align_of::<Src>(),
+            },
+            CastError::<Src, Dst>::Size(_) => {
+                panic!(
+                    "VolatileMemory::get_slice(offset, count) returned slice of length != count. (expected: `{}`, got: `{}`",
+                    size_of::<Dst>(),
+                    size_of::<Src>()
+                )
+            }
+            CastError::<Src, Dst>::Validity(infallible) => {
+                // Ensures that the validity case is actually infallible.
+                let _: core::convert::Infallible = infallible;
+                unreachable!()
+            }
+        }
+    }
 }
 
 /// Result of volatile memory operations.
@@ -131,14 +161,11 @@ pub trait VolatileMemory {
     }
 
     /// Gets a `VolatileRef` at `offset`.
-    fn get_ref<T: ByteValued>(&self, offset: usize) -> Result<VolatileRef<'_, T, BS<'_, Self::B>>> {
+    fn get_ref<T: FromBytes + IntoBytes + Copy + Send + Sync>(
+        &self,
+        offset: usize,
+    ) -> Result<VolatileRef<'_, T, BS<'_, Self::B>>> {
         let slice = self.get_slice(offset, size_of::<T>())?;
-
-        assert_eq!(
-            slice.len(),
-            size_of::<T>(),
-            "VolatileMemory::get_slice(offset, count) returned slice of length != count."
-        );
 
         // SAFETY: This is safe because the invariants of the constructors of VolatileSlice ensure that
         // slice.addr is valid memory of size slice.len(). The assert above ensures that
@@ -156,7 +183,7 @@ pub trait VolatileMemory {
 
     /// Returns a [`VolatileArrayRef`](struct.VolatileArrayRef.html) of `n` elements starting at
     /// `offset`.
-    fn get_array_ref<T: ByteValued>(
+    fn get_array_ref<T: FromBytes + IntoBytes + Copy + Send + Sync>(
         &self,
         offset: usize,
         n: usize,
@@ -202,24 +229,17 @@ pub trait VolatileMemory {
     ///
     /// If the resulting pointer is not aligned, this method will return an
     /// [`Error`](enum.Error.html).
-    unsafe fn aligned_as_ref<T: ByteValued>(&self, offset: usize) -> Result<&T> {
-        let slice = self.get_slice(offset, size_of::<T>())?;
-        slice.check_alignment(align_of::<T>())?;
+    unsafe fn aligned_as_ref<T: FromBytes + Immutable + KnownLayout + Copy + Send + Sync>(
+        &self,
+        offset: usize,
+    ) -> Result<&T> {
+        let volatile_slice = self.get_slice(offset, size_of::<T>())?;
 
-        assert_eq!(
-            slice.len(),
-            size_of::<T>(),
-            "VolatileMemory::get_slice(offset, count) returned slice of length != count."
-        );
-
+        //TODO
         // SAFETY: This is safe because the invariants of the constructors of VolatileSlice ensure that
-        // slice.addr is valid memory of size slice.len(). The assert above ensures that
-        // the length of the slice is exactly enough to hold one `T`.
-        // Dereferencing the pointer is safe because we check the alignment above, and the invariants
-        // of this function ensure that no aliasing pointers exist. Lastly, the lifetime of the
-        // returned VolatileArrayRef match that of the VolatileSlice returned by get_slice and thus the
-        // lifetime one `self`.
-        unsafe { Ok(&*(slice.addr as *const T)) }
+        // slice.addr is valid memory of size slice.len().
+        let rust_slice = slice::from_raw_parts(volatile_slice.addr, size_of::<T>());
+        Ok(T::ref_from_bytes(rust_slice).map_err(|error| (volatile_slice.addr.addr(), error))?)
     }
 
     /// Returns a mutable reference to an instance of `T` at `offset`. Mutable accesses performed
@@ -238,16 +258,13 @@ pub trait VolatileMemory {
     // the function is unsafe, and the conversion is safe if following the safety
     // instrutions above
     #[allow(clippy::mut_from_ref)]
-    unsafe fn aligned_as_mut<T: ByteValued>(&self, offset: usize) -> Result<&mut T> {
-        let slice = self.get_slice(offset, size_of::<T>())?;
-        slice.check_alignment(align_of::<T>())?;
+    unsafe fn aligned_as_mut<T: FromBytes + KnownLayout + IntoBytes + Copy + Send + Sync>(
+        &self,
+        offset: usize,
+    ) -> Result<&mut T> {
+        let volatile_slice = self.get_slice(offset, size_of::<T>())?;
 
-        assert_eq!(
-            slice.len(),
-            size_of::<T>(),
-            "VolatileMemory::get_slice(offset, count) returned slice of length != count."
-        );
-
+        //TODO
         // SAFETY: This is safe because the invariants of the constructors of VolatileSlice ensure that
         // slice.addr is valid memory of size slice.len(). The assert above ensures that
         // the length of the slice is exactly enough to hold one `T`.
@@ -256,7 +273,11 @@ pub trait VolatileMemory {
         // returned VolatileArrayRef match that of the VolatileSlice returned by get_slice and thus the
         // lifetime one `self`.
 
-        unsafe { Ok(&mut *(slice.addr as *mut T)) }
+        // SAFETY: This is safe because the invariants of the constructors of VolatileSlice ensure that
+        // slice.addr is valid memory of size slice.len().
+        let rust_slice = slice::from_raw_parts_mut(volatile_slice.addr, size_of::<T>());
+
+        Ok(T::mut_from_bytes(rust_slice).map_err(|error| (volatile_slice.addr.addr(), error))?)
     }
 
     /// Returns a reference to an instance of `T` at `offset`. Mutable accesses performed
@@ -267,23 +288,21 @@ pub trait VolatileMemory {
     ///
     /// If the resulting pointer is not aligned, this method will return an
     /// [`Error`](enum.Error.html).
-    fn get_atomic_ref<T: AtomicInteger>(&self, offset: usize) -> Result<&T> {
-        let slice = self.get_slice(offset, size_of::<T>())?;
-        slice.check_alignment(align_of::<T>())?;
+    fn get_atomic_ref<T: AtomicInteger + FromBytes + IntoBytes + KnownLayout>(
+        &self,
+        offset: usize,
+    ) -> Result<&T> {
+        let volatile_slice = self.get_slice(offset, size_of::<T>())?;
 
-        assert_eq!(
-            slice.len(),
-            size_of::<T>(),
-            "VolatileMemory::get_slice(offset, count) returned slice of length != count."
-        );
-
+        //TODO
         // SAFETY: This is safe because the invariants of the constructors of VolatileSlice ensure that
         // slice.addr is valid memory of size slice.len(). The assert above ensures that
         // the length of the slice is exactly enough to hold one `T`.
         // Dereferencing the pointer is safe because we check the alignment above. Lastly, the lifetime of the
         // returned VolatileArrayRef match that of the VolatileSlice returned by get_slice and thus the
         // lifetime one `self`.
-        unsafe { Ok(&*(slice.addr as *const T)) }
+        let rust_slice = unsafe { slice::from_raw_parts_mut(volatile_slice.addr, size_of::<T>()) };
+        Ok(T::mut_from_bytes(rust_slice).map_err(|error| (volatile_slice.addr.addr(), error))?)
     }
 
     /// Returns the sum of `base` and `offset` if it is valid to access a range of `offset`
@@ -320,9 +339,6 @@ impl<'a> From<&'a mut [u8]> for VolatileSlice<'a, ()> {
         unsafe { VolatileSlice::new(value.as_mut_ptr(), value.len()) }
     }
 }
-
-#[repr(C, packed)]
-struct Packed<T>(T);
 
 /// A guard to perform mapping and protect unmapping of the memory.
 #[derive(Debug)]
@@ -578,7 +594,7 @@ impl<'a, B: BitmapSlice> VolatileSlice<'a, B> {
     /// ```
     pub fn copy_to<T>(&self, buf: &mut [T]) -> usize
     where
-        T: ByteValued,
+        T: FromBytes + IntoBytes + Copy + Send + Sync,
     {
         // A fast path for u8/i8
         if size_of::<T>() == 1 {
@@ -657,7 +673,7 @@ impl<'a, B: BitmapSlice> VolatileSlice<'a, B> {
     /// ```
     pub fn copy_from<T>(&self, buf: &[T])
     where
-        T: ByteValued,
+        T: FromBytes + IntoBytes + Copy + Send + Sync,
     {
         // A fast path for u8/i8
         if size_of::<T>() == 1 {
@@ -680,19 +696,6 @@ impl<'a, B: BitmapSlice> VolatileSlice<'a, B> {
             // `VolatileArrayRef::copy_from` already takes care of that.
             dest.copy_from(buf);
         };
-    }
-
-    /// Checks if the current slice is aligned at `alignment` bytes.
-    fn check_alignment(&self, alignment: usize) -> Result<()> {
-        // Check that the desired alignment is a power of two.
-        debug_assert!((alignment & (alignment - 1)) == 0);
-        if ((self.addr as usize) & (alignment - 1)) != 0 {
-            return Err(Error::Misaligned {
-                addr: self.addr as usize,
-                alignment,
-            });
-        }
-        Ok(())
     }
 }
 
@@ -890,14 +893,14 @@ impl<B: BitmapSlice> VolatileMemory for VolatileSlice<'_, B> {
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct VolatileRef<'a, T, B = ()> {
-    addr: *mut Packed<T>,
+    addr: *mut Unalign<T>,
     bitmap: B,
     mmap: Option<&'a MmapInfo>,
 }
 
 impl<T> VolatileRef<'_, T, ()>
 where
-    T: ByteValued,
+    T: FromBytes + IntoBytes + Copy + Send + Sync,
 {
     /// Creates a [`VolatileRef`](struct.VolatileRef.html) to an instance of `T`.
     ///
@@ -915,7 +918,7 @@ where
 #[allow(clippy::len_without_is_empty)]
 impl<'a, T, B> VolatileRef<'a, T, B>
 where
-    T: ByteValued,
+    T: FromBytes + IntoBytes + Copy + Send + Sync,
     B: BitmapSlice,
 {
     /// Creates a [`VolatileRef`](struct.VolatileRef.html) to an instance of `T`, using the
@@ -929,7 +932,7 @@ where
     /// accesses.
     pub unsafe fn with_bitmap(addr: *mut u8, bitmap: B, mmap: Option<&'a MmapInfo>) -> Self {
         VolatileRef {
-            addr: addr as *mut Packed<T>,
+            addr: addr.cast(),
             bitmap,
             mmap,
         }
@@ -971,7 +974,7 @@ where
         let guard = self.ptr_guard_mut();
 
         // SAFETY: Safe because we checked the address and size when creating this VolatileRef.
-        unsafe { write_volatile(guard.as_ptr() as *mut Packed<T>, Packed::<T>(v)) };
+        unsafe { write_volatile(guard.as_ptr().cast(), Unalign::new(v)) };
         self.bitmap.mark_dirty(0, self.len())
     }
 
@@ -984,7 +987,7 @@ where
         // For the purposes of demonstrating why read_volatile is necessary, try replacing the code
         // in this function with the commented code below and running `cargo test --release`.
         // unsafe { *(self.addr as *const T) }
-        unsafe { read_volatile(guard.as_ptr() as *const Packed<T>).0 }
+        unsafe { read_volatile(guard.as_ptr().cast::<Unalign<T>>()).get() }
     }
 
     /// Converts this to a [`VolatileSlice`](struct.VolatileSlice.html) with the same size and
@@ -1028,7 +1031,7 @@ pub struct VolatileArrayRef<'a, T, B = ()> {
 
 impl<T> VolatileArrayRef<'_, T>
 where
-    T: ByteValued,
+    T: FromBytes + IntoBytes + Copy + Send + Sync,
 {
     /// Creates a [`VolatileArrayRef`](struct.VolatileArrayRef.html) to an array of elements of
     /// type `T`.
@@ -1046,7 +1049,7 @@ where
 
 impl<'a, T, B> VolatileArrayRef<'a, T, B>
 where
-    T: ByteValued,
+    T: FromBytes + IntoBytes + Copy + Send + Sync,
     B: BitmapSlice,
 {
     /// Creates a [`VolatileArrayRef`](struct.VolatileArrayRef.html) to an array of elements of
@@ -1212,7 +1215,7 @@ where
         }
 
         let guard = self.ptr_guard();
-        let mut ptr = guard.as_ptr() as *const Packed<T>;
+        let mut ptr = guard.as_ptr().cast::<Unalign<T>>();
         let start = ptr;
 
         for v in buf.iter_mut().take(self.len()) {
@@ -1221,7 +1224,7 @@ where
             // ptr::add is safe because get_array_ref() validated that
             // size_of::<T>() * self.len() fits in an isize.
             unsafe {
-                *v = read_volatile(ptr).0;
+                *v = read_volatile(ptr).get();
                 ptr = ptr.add(1);
             }
         }
@@ -1299,7 +1302,7 @@ where
         } else {
             let guard = self.ptr_guard_mut();
             let start = guard.as_ptr();
-            let mut ptr = start as *mut Packed<T>;
+            let mut ptr = start.cast::<Unalign<T>>();
 
             for &v in buf.iter().take(self.len()) {
                 // SAFETY: write_volatile is safe because the pointers are range-checked when
@@ -1307,7 +1310,7 @@ where
                 // ptr::add is safe because get_array_ref() validated that
                 // size_of::<T>() * self.len() fits in an isize.
                 unsafe {
-                    write_volatile(ptr, Packed::<T>(v));
+                    write_volatile(ptr, Unalign::new(v));
                     ptr = ptr.add(1);
                 }
             }
@@ -1481,6 +1484,7 @@ mod tests {
     use std::num::NonZeroUsize;
     #[cfg(feature = "rawfd")]
     use vmm_sys_util::tempfile::TempFile;
+    use zerocopy::{FromBytes, IntoBytes};
 
     #[cfg(feature = "backend-bitmap")]
     use crate::bitmap::tests::{
@@ -2030,22 +2034,23 @@ mod tests {
 
     #[test]
     fn test_read_from_exceeds_size() {
-        #[derive(Debug, Default, Copy, Clone)]
+        #[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes)]
         struct BytesToRead {
             _val1: u128, // 16 bytes
             _val2: u128, // 16 bytes
         }
-        unsafe impl ByteValued for BytesToRead {}
+
         let cursor_size = 20;
         let image = vec![1u8; cursor_size];
 
         // Trying to read more bytes than we have space for in image
         // make the read_from function return maximum vec size (i.e. 20).
         let mut bytes_to_read = BytesToRead::default();
+        let mut bytes_to_read_volatile_slice = VolatileSlice::from(bytes_to_read.as_mut_bytes());
         assert_eq!(
             image
                 .as_slice()
-                .read_volatile(&mut bytes_to_read.as_bytes())
+                .read_volatile(&mut bytes_to_read_volatile_slice)
                 .unwrap(),
             cursor_size
         );
@@ -2268,7 +2273,7 @@ mod tests {
         index: usize,
         page_size: NonZeroUsize,
     ) where
-        T: ByteValued + From<u8>,
+        T: IntoBytes + FromBytes + Copy + Send + Sync + From<u8>,
     {
         let bitmap = AtomicBitmap::new(size_of_val(buf), page_size);
         let arr = unsafe {

@@ -146,20 +146,6 @@ object to translate I/O virtual addresses (IOVAs) into VMM user addresses
 (VUAs), which are then passed to the inner `GuestMemoryBackend`
 implementation (like `GuestMemoryMmap`).
 
-### Utilities and Helpers
-
-The following utilities and helper traits/macros are imported from the
-[crosvm project](https://chromium.googlesource.com/chromiumos/platform/crosvm/)
-with minor changes:
-
-- `ByteValued` (originally `DataInit`): types which are safe to be initialized
-  from raw data. A type `T` is `ByteValued` if and only if it can be
-  initialized by reading its contents from a byte array. This is generally true
-  for all plain-old-data structs.  It is notably not true for any type that
-  includes a reference.
-- `{Le,Be}_{16,32,64}`: explicit endian types useful for embedding in structs
-  or reinterpreting data.
-
 ## Relationships between Traits, Structs and Types
 
 **Traits**:
