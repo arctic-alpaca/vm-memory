@@ -1,5 +1,13 @@
 # Changelog
 
+## Upcoming Release
+
+## Removed
+
+- \[[#374](https://github.com/rust-vmm/vm-memory/pull/374)\] Removed `ByteValued` trait and `endian` module in favor of the `zerocopy` crate.
+    `ByteValued`'s functionality is now provided by `zerocopy::IntoBytes`, `zerocopy::FromBytes` and `zerocopy::Zeroed`.
+    `ByteValued::as_bytes` can be replaced with `VolatileSlices::from` for `&mut [u8]`.
+
 ## 0.18.0
 
 ### Changed
